@@ -14,8 +14,7 @@ MASK_TOKEN_ID = 126336  # [MASK] token for LLaDA
 
 
 class SFTDataset(Dataset):
-    # Added data_subset argument
-    def __init__(self, data_path_or_name, data_subset, tokenizer, max_seq_length=256, split="validation"): 
+    def __init__(self, data_path_or_name, tokenizer, max_seq_length=256, split="train", max_samples=None): 
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
@@ -28,57 +27,56 @@ class SFTDataset(Dataset):
         self.bos_token = tokenizer.bos_token if tokenizer.bos_token is not None else "<s>"
         self.eos_token = tokenizer.eos_token if tokenizer.eos_token is not None else "</s>"
 
-        # Load data using the datasets library, passing the subset name
-        self.data = self.load_data(data_path_or_name, data_subset, split)
+        # Load data using the datasets library
+        self.data = self.load_data(data_path_or_name, split, max_samples)
 
-    # Added data_subset argument
-    def load_data(self, data_path_or_name, data_subset, split):
-        print(f"Loading dataset '{data_path_or_name}' subset '{data_subset}' split '{split}'...")
+    def load_data(self, data_path_or_name, split, max_samples=None):
+        print(f"Loading dataset '{data_path_or_name}' split '{split}'...")
         try:
-            # Pass the subset name to load_dataset
-            dataset = load_dataset(data_path_or_name, name=data_subset, split=split) 
+            dataset = load_dataset(data_path_or_name, split=split)
             original_count = len(dataset)
             
-            # --- MODIFIED FILTER for MS MARCO ---
-            # Keep examples that have a query and at least one answer.
-            dataset = dataset.filter(lambda example: example.get('query') and example.get('answers') and len(example['answers']) > 0)
-            # --- END MODIFIED FILTER ---
+            # Filter for examples with at least 2 messages
+            dataset = dataset.filter(lambda example: 
+                example.get('messages') and 
+                len(example['messages']) >= 2
+            )
             
             filtered_count = len(dataset)
-            print(f"Loaded {original_count} examples, kept {filtered_count} examples after filtering for query/answers.")
+            print(f"Loaded {original_count} examples, kept {filtered_count} examples after filtering.")
+
+            # Limit dataset size if specified
+            if max_samples is not None and max_samples > 0:
+                dataset = dataset.select(range(min(max_samples, len(dataset))))
+                print(f"Limited dataset to {len(dataset)} examples for testing")
+
             return dataset
         except Exception as e:
             print(f"Error loading dataset: {e}")
-            # Add fallback logic if necessary, though load_dataset should handle ms_marco
-            return [] # Return empty list on failure
+            return []
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         item = self.data[idx]
+        messages = item.get('messages', [])
 
-        # --- Extract data for MS MARCO ---
-        query = item.get('query')
-        answers = item.get('answers')
-
-        # Basic check if data is valid after filtering (should be)
-        if not query or not answers:
-            print(f"Warning: Skipping item {idx} due to missing query or answers after filtering: {item}")
+        # Simply take the first two messages
+        if len(messages) < 2:
+            print(f"Warning: Skipping item {idx} due to insufficient messages")
             dummy_ids = [self.pad_token_id] * self.max_seq_length
             return {
                 "input_ids": torch.tensor(dummy_ids, dtype=torch.long),
                 "prompt_length": torch.tensor(0, dtype=torch.long),
             }
-        
-        # Use the first answer as the target response
-        answer = answers[0] 
-        # --- End MS MARCO data extraction ---
 
-        # --- Apply LLaDA Template ---
-        prompt_section = f"{self.bos_token}{self.start_id_token}user{self.end_id_token}\n{query}{self.eot_id_token}"
-        response_section = f"{self.start_id_token}assistant{self.end_id_token}\n{answer}{self.eos_token}"
-        # --- End LLaDA Template ---
+        user_message = messages[0]["content"]
+        assistant_message = messages[1]["content"]
+
+        # Apply LLaDA Template
+        prompt_section = f"{self.bos_token}{self.start_id_token}user{self.end_id_token}\n{user_message}{self.eot_id_token}"
+        response_section = f"{self.start_id_token}assistant{self.end_id_token}\n{assistant_message}{self.eos_token}"
 
         prompt_tokens = self.tokenizer.encode(prompt_section, add_special_tokens=False)
         response_tokens = self.tokenizer.encode(response_section, add_special_tokens=False)
@@ -129,9 +127,14 @@ def train(args):
     model = AutoModel.from_pretrained(
         args.model_name,
         trust_remote_code=True,
-        device_map="auto",
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     )
+    
+    # Tie the weights before device mapping
+    model.tie_weights()
+    
+    # Now apply device mapping
+    model = model.to(device)
 
     lora_config = LoraConfig(
         r=args.lora_r,
@@ -144,16 +147,18 @@ def train(args):
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    print(f"Loading dataset with max_samples={args.max_samples}")
     dataset = SFTDataset(
         args.data_path,
-        args.data_subset,
         tokenizer,
-        max_seq_length=args.max_seq_len
+        max_seq_length=args.max_seq_len,
+        max_samples=args.max_samples
     )
 
     if not dataset or len(dataset) == 0:
         print("Failed to load dataset or dataset is empty. Exiting.")
         return
+    print(f"Dataset size: {len(dataset)} examples")
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -245,8 +250,7 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LoRA Fine-tuning for LLaDA")
     parser.add_argument("--model_name", type=str, default="GSAI-ML/LLaDA-8B-Instruct", help="Base LLaDA model")
-    parser.add_argument("--data_path", type=str, required=True, help="Path to training data (local path or HF dataset name like 'allenai/llama-3-tulu-v2-sft-subset')")
-    parser.add_argument("--data_subset", type=str, default=None, help="Subset name for the dataset (e.g., 'v2.1' for ms_marco)")
+    parser.add_argument("--data_path", type=str, default="allenai/llama-3-tulu-v2-sft-subset", help="Path to training data (local path or HF dataset name)")
     parser.add_argument("--output_dir", type=str, default="./llada-lora-sft", help="Directory to save LoRA adapters")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size per GPU")
@@ -256,6 +260,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps", type=int, default=100, help="Number of warmup steps for scheduler")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
+    parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to load")
 
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
